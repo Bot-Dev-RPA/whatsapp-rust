@@ -20,6 +20,35 @@ use super::audio::{
     AudioCodec, AudioConfig, AudioFormat, AudioIo, AudioRtpProfile, EncodedAudioFrame,
 };
 use super::demux::{RelayPacketKind, classify_relay_packet};
+
+// DIAGNOSTIC (2026-07-25): inbound relay-packet census for issue #1098 (the caller receives no
+// audio). Every early return in `on_rtp` is silent, so "the relay never forwards the peer's media"
+// and "media arrives but fails to decrypt" are indistinguishable from the outside. Counters are
+// process-wide and monotonic - read the DELTA across one call, not the absolute value. Absence of
+// any RELAYSTAT line for a whole call means ZERO inbound packets.
+pub mod relaystat {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    pub static STUN: AtomicU64 = AtomicU64::new(0);
+    pub static RTCP: AtomicU64 = AtomicU64::new(0);
+    pub static RTP: AtomicU64 = AtomicU64::new(0);
+    pub static OTHER: AtomicU64 = AtomicU64::new(0);
+    pub static BAD_HEADER: AtomicU64 = AtomicU64::new(0);
+    pub static PT_REJECT: AtomicU64 = AtomicU64::new(0);
+    pub static UNPROTECT_FAIL: AtomicU64 = AtomicU64::new(0);
+    pub static RTP_OK: AtomicU64 = AtomicU64::new(0);
+    pub static VIDEO_PT: AtomicU64 = AtomicU64::new(0);
+    pub fn bump(c: &AtomicU64) -> u64 {
+        c.fetch_add(1, Ordering::Relaxed) + 1
+    }
+    pub fn dump(tag: &str) {
+        let g = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        log::warn!(
+            "RELAYSTAT [{tag}] in: stun={} rtcp={} rtp={} other={} videopt={} | rtp outcome: bad_header={} pt_reject={} unprotect_FAIL={} ok={}",
+            g(&STUN), g(&RTCP), g(&RTP), g(&OTHER), g(&VIDEO_PT),
+            g(&BAD_HEADER), g(&PT_REJECT), g(&UNPROTECT_FAIL), g(&RTP_OK)
+        );
+    }
+}
 use super::h264::{VideoFrame, au_has_idr, au_is_keyframe};
 #[cfg(feature = "voip-mlow")]
 use super::mlow;
@@ -228,8 +257,24 @@ impl CallConfig {
         use super::{relay_parse, ssrc};
 
         let ep = relay_parse::get_media_relay_endpoint(relay).ok_or(SetupError::NoRelayEndpoint)?;
-        let (relay_ip, relay_port) =
+        // The MEDIA transport dials the web client port, NOT the port the `te2` advertises.
+        //
+        // Every `te2` in a live 1:1 relay block advertises 3478, and no Meta relay answers there:
+        // a real DTLS 1.2 ClientHello (the exact first packet `connect_relay_media` sends) to four
+        // relays - 57.144.43.54, 57.144.211.54, 57.144.123.54, 163.70.144.62 - drew no reply on
+        // 3478 and a full response on 3480, from inside a container AND from the host, while
+        // stun.cloudflare.com:3478 answered normally (so 3478 is not filtered). Dialing the
+        // advertised port therefore hangs the handshake until RELAY_CONNECT_TIMEOUT and every
+        // call, incoming and outgoing, fails with "DTLS/SCTP didn't complete".
+        //
+        // [`get_media_relay_endpoint`] already prefers an endpoint that ADVERTISES
+        // [`WEB_CLIENT_RELAY_PORT`], but that preference cannot fire when no endpoint advertises it,
+        // which is the only shape observed in the wild. Substituting the port here is what makes a
+        // web client reach the relay at all. The advertised port stays authoritative for
+        // relaylatency (`get_ipv4_address_bytes`), which reports to the PEER and must not change.
+        let (relay_ip, _advertised_port) =
             relay_parse::get_primary_ipv4_address(ep).ok_or(SetupError::NoRelayIpv4)?;
+        let relay_port = relay_parse::WEB_CLIENT_RELAY_PORT;
         // A padded-empty slot (a sparse token block) is a missing token, not a zero-length one: reject
         // it here so the nothing-usable fallback surfaces a precise NoRelayToken instead of dialing the
         // relay with an empty token and failing at the allocate.
@@ -717,7 +762,9 @@ impl CallEngine {
     /// every inbound frame decrypts to garbage. No-op (`true`) for a control-only engine (no media).
     /// `false` means the stored call_key is malformed (a setup invariant), so the driver ends the call.
     pub fn rekey_recv(&mut self, answering_peer_lid: &str) -> bool {
+        log::warn!("RELAYSTAT rekey_recv -> answering_peer_lid={answering_peer_lid:?}");
         let Some(m) = self.media.as_mut() else {
+            log::warn!("RELAYSTAT rekey_recv: NO MEDIA PLANE (control-only engine), rekey skipped");
             return true;
         };
         if !m.pipe.rekey_recv(&m.call_key, answering_peer_lid) {
@@ -982,10 +1029,29 @@ impl CallEngine {
 
     fn on_packet(&mut self, now: Millis, pkt: &[u8]) {
         match classify_relay_packet(pkt) {
-            RelayPacketKind::Stun => self.on_stun(now, pkt),
-            RelayPacketKind::Rtp => self.on_rtp(now, pkt),
-            RelayPacketKind::Rtcp => self.on_rtcp(now, pkt),
-            RelayPacketKind::Other => {}
+            RelayPacketKind::Stun => {
+                // STUN consent keepalives flow whenever the relay is talking to us at all, so this
+                // is the heartbeat that separates "relay silent" from "relay sends no MEDIA".
+                if relaystat::bump(&relaystat::STUN).is_multiple_of(10) {
+                    relaystat::dump("stun");
+                }
+                self.on_stun(now, pkt)
+            }
+            RelayPacketKind::Rtp => {
+                if relaystat::bump(&relaystat::RTP).is_multiple_of(50) {
+                    relaystat::dump("rtp");
+                }
+                self.on_rtp(now, pkt)
+            }
+            RelayPacketKind::Rtcp => {
+                if relaystat::bump(&relaystat::RTCP).is_multiple_of(10) {
+                    relaystat::dump("rtcp");
+                }
+                self.on_rtcp(now, pkt)
+            }
+            RelayPacketKind::Other => {
+                relaystat::bump(&relaystat::OTHER);
+            }
         }
     }
 
@@ -1085,9 +1151,11 @@ impl CallEngine {
         // distinct SSRCs/ROC trackers, so feeding a video packet through the audio pipeline
         // would fail its MI tag at best and desync at worst.
         let Some(wire_header) = parse_rtp_header(pkt) else {
+            relaystat::bump(&relaystat::BAD_HEADER);
             return;
         };
         if wire_header.payload_type == RTP_PAYLOAD_TYPE_H264 {
+            relaystat::bump(&relaystat::VIDEO_PT);
             // A PT-97 packet with no ACTIVE video plane (not negotiated, or after a downgrade) is
             // dropped. The pipe still advances its recv ROC on drop-free packets it never sees, but
             // an inactive plane simply ignores them.
@@ -1117,11 +1185,18 @@ impl CallEngine {
             .format
             .accepts_rtp_payload_type(wire_header.payload_type)
         {
+            relaystat::bump(&relaystat::PT_REJECT);
             return;
         }
         let Some((header, payload)) = m.pipe.unprotect_audio(pkt) else {
+            // SRTP/SFrame rejected it: a wrong recv key (participant id / a missed rekey to the
+            // device that actually answered) or a bad MI tag.
+            if relaystat::bump(&relaystat::UNPROTECT_FAIL).is_multiple_of(25) {
+                relaystat::dump("unprotect-fail");
+            }
             return;
         };
+        relaystat::bump(&relaystat::RTP_OK);
         m.audio_reception.observe(
             header.ssrc,
             header.sequence_number,

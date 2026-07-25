@@ -170,6 +170,11 @@ pub enum CallAction {
     Reject {
         call_id: String,
         call_creator: Jid,
+        /// Why the device rejected. `busy` means THAT DEVICE cannot take the call (already in one,
+        /// or a companion that does not do voice) - it is not the callee declining, and the peer's
+        /// other devices keep ringing. Absent means an explicit decline by the user.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     Terminate {
         call_id: String,

@@ -305,6 +305,40 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
         }
         "accept" => {
             attrs.finish().map_err(|e| anyhow!("<accept> attrs: {e}"))?;
+            // DIAGNOSTIC (2026-07-25): the callee's `<te>` transport endpoints are currently
+            // DISCARDED by this parse (only <audio> survives). Dump them so a live capture shows
+            // where the callee actually is, vs the relay endpoint the caller dialed - the open
+            // question for issue #1098 (caller receives zero RTP).
+            for te in node
+                .children()
+                .unwrap_or_default()
+                .iter()
+                .filter(|c| c.tag == "te")
+            {
+                let pri = te
+                    .attrs()
+                    .optional_string("priority")
+                    .map(|c| c.into_owned())
+                    .unwrap_or_default();
+                let bytes = te
+                    .content_bytes()
+                    .map(<[u8]>::to_vec)
+                    .or_else(|| te.content_str().map(|s| s.as_bytes().to_vec()))
+                    .unwrap_or_default();
+                let shown = if bytes.len() == 6 {
+                    format!(
+                        "{}.{}.{}.{}:{}",
+                        bytes[0],
+                        bytes[1],
+                        bytes[2],
+                        bytes[3],
+                        (u16::from(bytes[4]) << 8) | u16::from(bytes[5])
+                    )
+                } else {
+                    format!("{}B {bytes:02x?}", bytes.len())
+                };
+                log::warn!("ACCEPTTE callee endpoint priority={pri} -> {shown}");
+            }
             let audio = node
                 .children()
                 .unwrap_or_default()
@@ -319,10 +353,15 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
             }
         }
         "reject" => {
+            // `reason` distinguishes a device that CANNOT take the call (`busy`) from the callee
+            // actually declining; dropping it made both look identical and ended calls the peer's
+            // other devices were still answering.
+            let reason = attrs.optional_string("reason").map(|c| c.into_owned());
             attrs.finish().map_err(|e| anyhow!("<reject> attrs: {e}"))?;
             CallAction::Reject {
                 call_id,
                 call_creator,
+                reason,
             }
         }
         "video" => {
@@ -444,6 +483,12 @@ pub const TERMINATE_REASON_ACCEPTED_ELSEWHERE: &str = "accepted_elsewhere";
 pub const TERMINATE_REASON_REJECTED_ELSEWHERE: &str = "rejected_elsewhere";
 pub const TERMINATE_REASON_TIMEOUT: &str = "timeout";
 pub const TERMINATE_REASON_GROUP_CALL_ENDED: &str = "group_call_ended";
+
+/// `<reject reason>` wire token for a device that cannot take the call - already in a call, or a
+/// companion that does not do voice at all. It is a statement about ONE DEVICE, not the callee's
+/// decision: the peer's remaining devices go on ringing, and a live capture shows them reaching
+/// `preaccept` 190ms after a companion sent this. Treating it as a decline ended those calls.
+pub const REJECT_REASON_BUSY: &str = "busy";
 
 /// Relay latency wire encoding: `0x2000000 + rtt_ms`.
 pub fn encode_latency(rtt_ms: u32) -> String {
