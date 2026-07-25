@@ -1432,6 +1432,47 @@ mod tests {
         }
     }
 
+    /// A `<reject>` from a device that cannot take the call carries `reason="busy"`. Dropping it
+    /// made a busy companion indistinguishable from the callee declining, which ended calls the
+    /// peer's other devices were still answering.
+    #[test]
+    fn reject_preserves_a_busy_reason() {
+        let node = base_call_builder()
+            .children([NodeBuilder::new("reject")
+                .attr("call-creator", fake_caller_lid())
+                .attr("call-id", "CID")
+                .attr("count", "0")
+                .attr("reason", REJECT_REASON_BUSY)
+                .build()])
+            .build();
+
+        let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
+        match call.action {
+            CallAction::Reject { reason, .. } => {
+                assert_eq!(reason.as_deref(), Some(REJECT_REASON_BUSY));
+            }
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    /// The failure case for the above: an explicit decline carries no `reason`, and must not be
+    /// confused with a busy device.
+    #[test]
+    fn reject_without_a_reason_parses_as_none() {
+        let node = base_call_builder()
+            .children([NodeBuilder::new("reject")
+                .attr("call-creator", fake_caller_lid())
+                .attr("call-id", "CID")
+                .build()])
+            .build();
+
+        let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
+        match call.action {
+            CallAction::Reject { reason, .. } => assert_eq!(reason, None),
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
     #[test]
     fn transport_and_relaylatency_are_parsed_not_dropped() {
         // Regression: these were missing from KNOWN_ACTIONS and silently dropped (Ok(None)).

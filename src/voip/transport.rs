@@ -5,7 +5,9 @@
 //! run an SCTP association over it, and open the pre-negotiated id=0 DataChannel that carries
 //! STUN/RTP/RTCP as binary messages.
 
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
@@ -309,6 +311,27 @@ impl RelayMediaChannelFactory {
     }
 }
 
+/// The relay addresses to dial concurrently for `advertised`.
+///
+/// Which UDP port a relay serves media on is NOT derivable from the offer: it varies per relay host
+/// AND per session. Measured with a real DTLS 1.2 ClientHello, one account was handed 57.144.43.54 /
+/// .211.54 / .123.54 / 163.70.144.62 (answer on 3480, silent on 3478) and another, minutes later,
+/// 57.144.43.57 / .211.57 / .123.57 / 163.70.140.133 (answer on 3478, silent on 3480) - while every
+/// one of them ADVERTISED 3478. A port scan of 3470-3495 (plus 443/5349/19302) found each host
+/// answering on exactly one port, always 3478 or 3480. So neither the advertised port nor a fixed
+/// [`WEB_CLIENT_RELAY_PORT`] is right on its own: each is correct for some relays and black-holes
+/// for the rest, costing a full `RELAY_CONNECT_TIMEOUT` and failing the call.
+///
+/// The advertised port comes first so a relay that honours it is dialled on the port it asked for.
+/// Never yields a duplicate, which would double-dial the same endpoint for nothing.
+fn dial_candidates(advertised: SocketAddr) -> Vec<SocketAddr> {
+    let mut out = vec![advertised];
+    if advertised.port() != WEB_CLIENT_RELAY_PORT {
+        out.push(SocketAddr::new(advertised.ip(), WEB_CLIENT_RELAY_PORT));
+    }
+    out
+}
+
 #[async_trait]
 impl RelayTransportFactory for RelayMediaChannelFactory {
     async fn connect(
@@ -317,29 +340,19 @@ impl RelayTransportFactory for RelayMediaChannelFactory {
         Arc<dyn RelayTransport>,
         async_channel::Receiver<RelayTransportEvent>,
     )> {
-        // Which UDP port a relay serves media on is NOT derivable from the offer: it varies per
-        // relay host AND per session. Measured with a real DTLS 1.2 ClientHello, one account was
-        // handed 57.144.43.54 / .211.54 / .123.54 / 163.70.144.62 (answer on 3480, silent on 3478)
-        // and another, minutes later, 57.144.43.57 / .211.57 / .123.57 / 163.70.140.133 (answer on
-        // 3478, silent on 3480) - while every one of them ADVERTISED 3478 in its `te2`. So neither
-        // the advertised port nor a fixed WEB_CLIENT_RELAY_PORT is right on its own: each is
-        // correct for some relays and black-holes for the rest, costing a full
-        // RELAY_CONNECT_TIMEOUT and failing the call.
-        //
-        // Race them instead and keep whichever completes the handshake. `select_ok` discards the
-        // loser's error and drops its future, which aborts that dial. Cost when the advertised port
-        // is right is one extra UDP socket for the duration of the handshake; the alternative -
-        // trying serially - would add 12s to every call on the other relay family.
-        let mut candidates: Vec<
-            std::pin::Pin<Box<dyn core::future::Future<Output = Result<RelayMediaChannel>> + Send>>,
-        > = vec![Box::pin(connect_relay_media(
-            self.addr,
-            self.runtime.clone(),
-        ))];
-        if self.addr.port() != WEB_CLIENT_RELAY_PORT {
-            let alt = SocketAddr::new(self.addr.ip(), WEB_CLIENT_RELAY_PORT);
-            candidates.push(Box::pin(connect_relay_media(alt, self.runtime.clone())));
-        }
+        // Race every candidate port (see `dial_candidates`) and keep whichever completes the
+        // handshake. `select_ok` discards the losers' errors and drops their futures, aborting those
+        // dials. Cost when the advertised port is the right one is a second UDP socket for the
+        // duration of the handshake; trying serially would instead add a full RELAY_CONNECT_TIMEOUT
+        // to every call on the other relay family.
+        let candidates: Vec<Pin<Box<dyn Future<Output = Result<RelayMediaChannel>> + Send>>> =
+            dial_candidates(self.addr)
+                .into_iter()
+                .map(|addr| {
+                    Box::pin(connect_relay_media(addr, self.runtime.clone()))
+                        as Pin<Box<dyn Future<Output = _> + Send>>
+                })
+                .collect();
         // Bound the UDP+DTLS+SCTP+DataChannel handshake: a relay whose UDP is reachable but whose
         // DTLS/SCTP wedges (black-holed endpoint) would otherwise park the caller forever with no
         // failure surfaced. Matches the old connect_and_allocate's 12s timeout.
@@ -474,6 +487,28 @@ mod tests {
 
     // Reads become PacketReceived events; a drained stream (Ok(0)) becomes Disconnected(Closed) and
     // ends the pump. Unbounded channel so the EOF send never blocks.
+    /// A relay that advertises 3478 must still be tried on the web client port, since which of the
+    /// two a host actually serves is not visible in the offer.
+    #[test]
+    fn dial_candidates_adds_the_web_client_port() {
+        let advertised: SocketAddr = "57.144.43.57:3478".parse().unwrap();
+        assert_eq!(
+            dial_candidates(advertised),
+            vec![
+                advertised,
+                "57.144.43.57:3480".parse::<SocketAddr>().unwrap()
+            ],
+            "the advertised port is dialled first, with 3480 raced alongside it"
+        );
+    }
+
+    /// The failure case: an endpoint already on the web client port must not be dialled twice.
+    #[test]
+    fn dial_candidates_does_not_duplicate_the_web_client_port() {
+        let advertised: SocketAddr = "170.78.54.98:3480".parse().unwrap();
+        assert_eq!(dial_candidates(advertised), vec![advertised]);
+    }
+
     #[tokio::test]
     async fn pump_maps_reads_then_eof_to_disconnect() {
         let reader = ScriptedReader::new([Ok(vec![1, 2, 3]), Ok(vec![4, 5])]);
