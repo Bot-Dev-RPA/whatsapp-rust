@@ -24,6 +24,7 @@ use webrtc_util_011::Conn as Conn011;
 
 use wacore::runtime::{AbortHandle, Runtime};
 use wacore::voip::engine::TxIdSource;
+use wacore::voip::relay_parse::WEB_CLIENT_RELAY_PORT;
 use wacore::voip::transport::{
     RelayDisconnectReason, RelayTransport, RelayTransportEvent, RelayTransportFactory,
 };
@@ -316,6 +317,29 @@ impl RelayTransportFactory for RelayMediaChannelFactory {
         Arc<dyn RelayTransport>,
         async_channel::Receiver<RelayTransportEvent>,
     )> {
+        // Which UDP port a relay serves media on is NOT derivable from the offer: it varies per
+        // relay host AND per session. Measured with a real DTLS 1.2 ClientHello, one account was
+        // handed 57.144.43.54 / .211.54 / .123.54 / 163.70.144.62 (answer on 3480, silent on 3478)
+        // and another, minutes later, 57.144.43.57 / .211.57 / .123.57 / 163.70.140.133 (answer on
+        // 3478, silent on 3480) - while every one of them ADVERTISED 3478 in its `te2`. So neither
+        // the advertised port nor a fixed WEB_CLIENT_RELAY_PORT is right on its own: each is
+        // correct for some relays and black-holes for the rest, costing a full
+        // RELAY_CONNECT_TIMEOUT and failing the call.
+        //
+        // Race them instead and keep whichever completes the handshake. `select_ok` discards the
+        // loser's error and drops its future, which aborts that dial. Cost when the advertised port
+        // is right is one extra UDP socket for the duration of the handshake; the alternative -
+        // trying serially - would add 12s to every call on the other relay family.
+        let mut candidates: Vec<
+            std::pin::Pin<Box<dyn core::future::Future<Output = Result<RelayMediaChannel>> + Send>>,
+        > = vec![Box::pin(connect_relay_media(
+            self.addr,
+            self.runtime.clone(),
+        ))];
+        if self.addr.port() != WEB_CLIENT_RELAY_PORT {
+            let alt = SocketAddr::new(self.addr.ip(), WEB_CLIENT_RELAY_PORT);
+            candidates.push(Box::pin(connect_relay_media(alt, self.runtime.clone())));
+        }
         // Bound the UDP+DTLS+SCTP+DataChannel handshake: a relay whose UDP is reachable but whose
         // DTLS/SCTP wedges (black-holed endpoint) would otherwise park the caller forever with no
         // failure surfaced. Matches the old connect_and_allocate's 12s timeout.
@@ -323,13 +347,14 @@ impl RelayTransportFactory for RelayMediaChannelFactory {
             wacore::runtime::timeout(
                 &*self.runtime,
                 RELAY_CONNECT_TIMEOUT,
-                connect_relay_media(self.addr, self.runtime.clone()),
+                futures::future::select_ok(candidates),
             )
                 .await
                 .map_err(|_| {
                     anyhow!("relay connect timed out after {RELAY_CONNECT_TIMEOUT:?} (DTLS/SCTP didn't complete)")
                 })?
-                .map_err(|e| anyhow!("relay connect: {e}"))?,
+                .map_err(|e| anyhow!("relay connect: {e}"))?
+                .0,
         );
         let (tx, rx) = async_channel::bounded(RELAY_EVENT_CAP);
         let _ = tx.try_send(RelayTransportEvent::Connected);

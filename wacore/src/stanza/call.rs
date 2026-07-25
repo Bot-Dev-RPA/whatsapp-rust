@@ -319,10 +319,15 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
             }
         }
         "reject" => {
+            // `reason` distinguishes a device that CANNOT take the call (`busy`) from the callee
+            // actually declining; dropping it made both look identical and ended calls the peer's
+            // other devices were still answering.
+            let reason = attrs.optional_string("reason").map(|c| c.into_owned());
             attrs.finish().map_err(|e| anyhow!("<reject> attrs: {e}"))?;
             CallAction::Reject {
                 call_id,
                 call_creator,
+                reason,
             }
         }
         "video" => {
@@ -444,6 +449,12 @@ pub const TERMINATE_REASON_ACCEPTED_ELSEWHERE: &str = "accepted_elsewhere";
 pub const TERMINATE_REASON_REJECTED_ELSEWHERE: &str = "rejected_elsewhere";
 pub const TERMINATE_REASON_TIMEOUT: &str = "timeout";
 pub const TERMINATE_REASON_GROUP_CALL_ENDED: &str = "group_call_ended";
+
+/// `<reject reason>` wire token for a device that cannot take the call - already in a call, or a
+/// companion that does not do voice at all. It is a statement about ONE DEVICE, not the callee's
+/// decision: the peer's remaining devices go on ringing, and a live capture shows them reaching
+/// `preaccept` 190ms after a companion sent this. Treating it as a decline ended those calls.
+pub const REJECT_REASON_BUSY: &str = "busy";
 
 /// Relay latency wire encoding: `0x2000000 + rtt_ms`.
 pub fn encode_latency(rtt_ms: u32) -> String {

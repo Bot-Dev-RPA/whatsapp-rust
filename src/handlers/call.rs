@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use log::{debug, warn};
 #[cfg(feature = "voip-runtime")]
 use wacore::stanza::call::{
-    TERMINATE_REASON_ACCEPTED_ELSEWHERE, TERMINATE_REASON_GROUP_CALL_ENDED,
+    REJECT_REASON_BUSY, TERMINATE_REASON_ACCEPTED_ELSEWHERE, TERMINATE_REASON_GROUP_CALL_ENDED,
     TERMINATE_REASON_REJECTED_ELSEWHERE, TERMINATE_REASON_TIMEOUT, TerminateParams,
     VideoStateParams, build_call_video_ack, build_terminate, build_video_state,
 };
@@ -198,11 +198,17 @@ impl StanzaHandler for CallHandler {
                             client.core.event_bus.dispatch(outcome);
                         }
                     }
+                    // A `busy` reject is ONE DEVICE saying it cannot take the call, not the callee
+                    // declining, so it must not tear the call down while the peer's other devices
+                    // are still ringing. Captured live: a companion sent `<reject reason="busy">`
+                    // 280ms after the offer, and the primary phone's `<preaccept>` arrived 190ms
+                    // AFTER we had already terminated. If every device is busy the call still ends
+                    // -- the server sends `<terminate reason="timeout">`, which is handled above.
                     #[cfg(feature = "voip-runtime")]
-                    if matches!(
-                        &call.action,
-                        CallAction::Reject { .. } | CallAction::Terminate { .. }
-                    ) {
+                    if matches!(&call.action, CallAction::Terminate { .. })
+                        || matches!(&call.action, CallAction::Reject { .. }
+                            if !reject_is_device_busy(&call.action))
+                    {
                         crate::voip::facade::terminate_call(&client, call.action.call_id());
                     }
                     #[cfg(feature = "voip-runtime")]
@@ -422,10 +428,27 @@ async fn send_offer_ack_receipt(client: &Client, call: &IncomingCall) -> anyhow:
 /// duplicate accept/reject can't re-dismiss. No-op for any other action, or a call we aren't the
 /// caller of (inbound call, single-device callee, or one already dismissed). A `Terminate` needs no
 /// handling here: the call ends, its registry entry (and the device set with it) goes away.
+/// Whether a `<reject>` says the DEVICE is unavailable rather than that the callee declined.
+///
+/// `busy` is a per-device statement (already in a call, or a companion with no voice support); the
+/// callee's other devices go on ringing and may still answer. Any other reason - including none -
+/// is the callee's own decision and ends the call.
+#[cfg(feature = "voip-runtime")]
+fn reject_is_device_busy(action: &CallAction) -> bool {
+    matches!(
+        action,
+        CallAction::Reject { reason, .. } if reason.as_deref() == Some(REJECT_REASON_BUSY)
+    )
+}
+
 #[cfg(feature = "voip-runtime")]
 async fn dismiss_outgoing_siblings(client: &Client, call: &IncomingCall) {
     let reason = match &call.action {
         CallAction::Accept { .. } => TERMINATE_REASON_ACCEPTED_ELSEWHERE,
+        // A `busy` device has not decided anything for the callee, so its siblings must keep
+        // ringing. Returning BEFORE take_dismiss_targets matters: that take is one-shot, and
+        // consuming the rung set here would leave a later genuine accept with nothing to dismiss.
+        CallAction::Reject { .. } if reject_is_device_busy(&call.action) => return,
         CallAction::Reject { .. } => TERMINATE_REASON_REJECTED_ELSEWHERE,
         _ => return,
     };
